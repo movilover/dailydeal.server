@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 // Environment validation. Missing/invalid values stop the server with a clear message (no secrets printed).
 export function loadConfig(env = process.env) {
   const errs = [];
@@ -9,7 +10,12 @@ export function loadConfig(env = process.env) {
   const encRaw = need('CONFIG_ENC_KEY');
   const hmac = need('OTP_HMAC_SECRET');
   let encKey = null;
-  if (encRaw) { try { encKey = Buffer.from(encRaw, 'base64'); if (encKey.length !== 32) errs.push('CONFIG_ENC_KEY অবশ্যই ৩২ বাইটের base64 হতে হবে'); } catch { errs.push('CONFIG_ENC_KEY ভুল'); } }
+  if (encRaw) {
+    const b = /^[A-Za-z0-9+/]+={0,2}$/.test(encRaw) ? Buffer.from(encRaw, 'base64') : null;
+    if (b && b.length === 32) encKey = b;                                                   // ৩২ বাইটের base64 হলে সরাসরি
+    else if (encRaw.length >= 32) encKey = crypto.createHash('sha256').update(encRaw).digest(); // নইলে যেকোনো ৩২+ অক্ষরের এলোমেলো লেখা থেকে কী বানানো হয়
+    else errs.push('CONFIG_ENC_KEY কমপক্ষে ৩২ অক্ষরের এলোমেলো লেখা হতে হবে');
+  }
   if (hmac && hmac.length < 24) errs.push('OTP_HMAC_SECRET কমপক্ষে ২৪ অক্ষরের হতে হবে');
   for (const o of origins) if (!/^https?:\/\/[^\s*]+$/.test(o)) errs.push(`ALLOWED_ORIGINS-এ ভুল মান: ${o}`);
   if (dbUrl && !/^https:\/\//.test(dbUrl)) errs.push('FIREBASE_DATABASE_URL https:// দিয়ে শুরু হতে হবে');
