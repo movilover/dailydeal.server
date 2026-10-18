@@ -3,12 +3,12 @@ import helmet from 'helmet';
 import cors from 'cors';
 import { createAuth } from './auth.js';
 import { createFlags } from './flags.js';
-import { createOtpConfig } from './otp/config.js';
-import { createChain } from './otp/chain.js';
-import { createOtpService } from './otp/service.js';
-import { otpRoutes } from './routes/otp.js';
-import { adminRoutes } from './routes/admin.js';
-import { lookupRoutes } from './routes/lookup.js';
+import { createOtpConfig } from './otp-config.js';
+import { createChain } from './otp-chain.js';
+import { createOtpService } from './otp-service.js';
+import { otpRoutes } from './route-otp.js';
+import { adminRoutes } from './route-admin.js';
+import { lookupRoutes } from './route-lookup.js';
 import { makeHttp } from './net.js';
 import { log } from './log.js';
 
