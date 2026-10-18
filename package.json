@@ -4,12 +4,12 @@
   "private": true,
   "description": "DailyDeal OTP/SMS backend (Railway)",
   "type": "module",
-  "main": "src/server.js",
+  "main": "server.js",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node server.js",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
