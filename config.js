@@ -6,7 +6,8 @@ export function loadConfig(env = process.env) {
   const saB64 = need('FIREBASE_SERVICE_ACCOUNT_B64');
   const dbUrl = need('FIREBASE_DATABASE_URL');
   const adminEmail = need('ADMIN_EMAIL').toLowerCase();
-  const origins = need('ALLOWED_ORIGINS').split(',').map((s) => s.trim().replace(/\/$/, '')).filter(Boolean);
+  // "https://name.github.io/dailydeal/" বা বড়-হাতের লিখলেও চলে: শুধু origin (স্কিম+হোস্ট+পোর্ট) রাখা হয়, কারণ ব্রাউজারের Origin হেডারে পাথ থাকে না
+  const origins = [...new Set(need('ALLOWED_ORIGINS').split(',').map((s) => s.trim()).filter(Boolean).map((s) => { try { return new URL(s).origin; } catch { return s; } }))];
   const encRaw = need('CONFIG_ENC_KEY');
   const hmac = need('OTP_HMAC_SECRET');
   let encKey = null;
