@@ -16,9 +16,11 @@ export function buildApp({ cfg, store, adminAuth, appCheck, http = makeHttp(), n
   const app = express();
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
-  app.use(helmet());
+  app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));   // পড়ার অনুমতি CORS ঠিক করে; এটি না দিলে ব্রাউজার ডায়াগনস্টিক আটকায়
   app.use(express.json({ limit: '32kb' }));
   const allowed = new Set(cfg.origins);
+  // /healthz সবার জন্য খোলা এবং যেকোনো Origin-এ উত্তর দেয়; শুধু জানায় কলারের Origin অনুমোদিত কিনা। অ্যাডমিন প্যানেল এ থেকে CORS-ভুল ধরে।
+  app.get('/healthz', (req, res) => { res.set('Access-Control-Allow-Origin', '*'); const o = req.headers.origin; res.json({ ok: true, t: now(), originAllowed: o ? allowed.has(o) : null }); });
   app.use((req, res, next) => { const o = req.headers.origin; if (o && !allowed.has(o)) return res.status(403).json({ ok: false, code: 'ORIGIN' }); next(); });
   app.use(cors({ origin: (o, cb) => cb(null, !o || allowed.has(o)), allowedHeaders: ['Authorization', 'Content-Type', 'X-Firebase-AppCheck'], methods: ['GET', 'POST', 'PUT', 'OPTIONS'], maxAge: 600 }));
   // coarse per-IP flood guard (in-memory; fine-grained limits live in the store)
@@ -32,7 +34,6 @@ export function buildApp({ cfg, store, adminAuth, appCheck, http = makeHttp(), n
   const setClaims = (uid, c) => adminAuth.setCustomUserClaims(uid, c);
   const otp = createOtpService({ store, cfg, chain, getOtpConfig: otpConfig.load, setClaims, now });
 
-  app.get('/healthz', (_q, res) => res.json({ ok: true, t: now() }));
   app.use('/otp', otpRoutes({ auth, otp, flags, adminAuth, store }));
   app.use('/admin', adminRoutes({ auth, otpConfig, chain, store, flags, cfg, otp }));
   app.use('/', lookupRoutes({ auth, store, otp }));
