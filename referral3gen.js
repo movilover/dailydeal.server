@@ -1,35 +1,12 @@
 'use strict';
 /**
  * referral-3gen.js — Daily Deal 3-Generation Referral + Referral Wallet + bKash/Nagad payouts
- * ---------------------------------------------------------------------------------------------
- * Add to your Railway server.js (next to facebook-meta):
+ * v2: + signup bonus for newcomers who join with a valid referral code (admin-configurable, default 20)
+ *     + error logging on every admin route, + GET /api/referral/health (diagnostics)
  *
- *     const mountReferral = require('./referral-3gen');
- *     mountReferral(app, { admin });
- *
- * ENV:  ADMIN_EMAIL (required, same as before) · SITE_URL (default https://dailydeal.world)
- *       ALLOWED_ORIGINS (optional) · REF_REQUIRE_PHONE_VERIFY (default "true" — strongly recommended)
- *
- * SECURITY MODEL
- *  - Every credit / debit happens ONLY here (firebase-admin). Browsers never write referral money.
- *  - A user "activates" referral by having a phone number verified by your existing OTP flow
- *    (Firebase custom claim `vph`). One phone = one referral identity, so fake/anonymous accounts
- *    cannot farm commissions.
- *  - Commission for a new member is written in ONE atomic multi-path update (profile + 3 wallets +
- *    3 ledger rows + team lists) guarded by a per-user lock and a one-phone-one-claim transaction.
- *
- * DATABASE (all new nodes; no existing node is touched):
- *  referralConfig                       { enabled, gen1, gen2, gen3, minWithdraw }   (defaults 50/30/15/500)
- *  referralProfiles/{cid}               { code, phone, p1, p2, p3, createdAt }       p1=direct referrer, p2/p3 = its referrers
- *  customerRefCodes/{CODE}              cid                                           (separate from reseller `referralCodes`)
- *  referralPhones/{phone}               cid                                           (one phone → one member)
- *  referralWallets/{cid}                { balance, totalEarned, totalWithdrawn, c1, c2, c3 }
- *  referralTx/{cid}/{id}                { type: commission|withdraw|refund, gen?, amount, label?, at, ... }
- *  referralTeam/{cid}/g1|g2|g3/{child}  { name(masked), phone(masked), at }
- *  referralPayouts/{id}                 admin payout history table
- *  referralMyPayouts/{cid}/{id}         { amount, method, number, status, at, processedAt?, trxId? }
- *  referralLocks/{cid}                  short lock timestamps
- *  `cid` = the customer id already used by customerWallets (value of uidMap/{authUid}).
+ * server.js:   const mountReferral = require('./referral-3gen');  mountReferral(app, { admin });
+ * ENV: ADMIN_EMAIL (required) · SITE_URL · ALLOWED_ORIGINS (comma list, MUST include the admin site origin,
+ *      e.g. https://movilover.github.io) · REF_REQUIRE_PHONE_VERIFY (default "true")
  */
 const crypto = require('crypto');
 const express = require('express');
@@ -46,8 +23,8 @@ module.exports = function mountReferral(app, opts) {
   const METHODS = ['bkash', 'nagad'];
   const log = (...a) => console.log('[referral]', ...a);
   const clip = (v, n) => String(v == null ? '' : v).slice(0, n);
+  const errTxt = (e) => String((e && (e.code || e.message)) || e).slice(0, 160);
 
-  /* ───────── helpers ───────── */
   const normPhone = (raw) => {
     let d = String(raw || '').replace(/\D/g, '');
     if (d.startsWith('880')) d = '0' + d.slice(3);
@@ -67,13 +44,13 @@ module.exports = function mountReferral(app, opts) {
     cfgCache = {
       enabled: v.enabled !== false,
       gen1: num(v.gen1, 50, 0, 100000), gen2: num(v.gen2, 30, 0, 100000), gen3: num(v.gen3, 15, 0, 100000),
+      signupBonus: num(v.signupBonus, 20, 0, 100000),
       minWithdraw: Math.floor(num(v.minWithdraw, 500, 1, 10000000)),
     };
     cfgAt = Date.now();
     return cfgCache;
   }
 
-  /* ───────── router, CORS, auth ───────── */
   const router = express.Router();
   const allowed = new Set([siteUrl].concat(String(process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim().replace(/\/+$/, '')).filter(Boolean)));
   router.use((req, res, next) => {
@@ -100,16 +77,17 @@ module.exports = function mountReferral(app, opts) {
       if (!cid) return res.status(400).json({ ok: false, code: 'NOUID', message: 'অ্যাকাউন্ট প্রস্তুত নয়, পেজ রিফ্রেশ করুন' });
       req.u = { uid: d.uid, cid: String(cid), vph: d.vph ? String(d.vph) : '' };
       next();
-    } catch (e) { res.status(401).json({ ok: false, code: 'BADTOKEN', message: 'সেশন শেষ, আবার চেষ্টা করুন' }); }
+    } catch (e) { log('requireUser', errTxt(e)); res.status(401).json({ ok: false, code: 'BADTOKEN', message: 'সেশন শেষ, আবার চেষ্টা করুন' }); }
   }
   async function requireAdmin(req, res, next) {
     try {
       const t = bearer(req);
-      if (!t || !adminEmail) return res.status(401).json({ ok: false, message: 'অ্যাডমিন লগইন দরকার' });
+      if (!adminEmail) return res.status(500).json({ ok: false, message: 'সার্ভারে ADMIN_EMAIL সেট করা নেই (Railway → Variables)' });
+      if (!t) return res.status(401).json({ ok: false, message: 'অ্যাডমিন লগইন দরকার' });
       const d = await admin.auth().verifyIdToken(t);
-      if (String(d.email || '').toLowerCase() !== adminEmail || d.email_verified === false) return res.status(403).json({ ok: false, message: 'শুধু মূল অ্যাডমিন পারবেন' });
+      if (String(d.email || '').toLowerCase() !== adminEmail || d.email_verified === false) return res.status(403).json({ ok: false, message: 'শুধু মূল অ্যাডমিন পারবেন (ADMIN_EMAIL মিলছে না)' });
       next();
-    } catch (e) { res.status(401).json({ ok: false, message: 'টোকেন সঠিক নয়' }); }
+    } catch (e) { log('requireAdmin', errTxt(e)); res.status(401).json({ ok: false, message: 'টোকেন সঠিক নয়: ' + errTxt(e) }); }
   }
   const withLock = async (cid, ms) => {
     const r = await db.ref('referralLocks/' + cid).transaction((cur) => (cur && Date.now() - cur < (ms || 20000) ? undefined : Date.now()));
@@ -117,13 +95,19 @@ module.exports = function mountReferral(app, opts) {
   };
   const unlock = (cid) => db.ref('referralLocks/' + cid).remove().catch(() => {});
 
-  /* ───────── public config ───────── */
-  router.get('/config', async (req, res) => {
-    try { const c = await getConfig(); res.set('Cache-Control', 'public, max-age=30').json({ ok: true, ...c, methods: METHODS }); }
-    catch (e) { res.status(500).json({ ok: false }); }
+  /* health: open https://YOUR-RAILWAY-URL/api/referral/health in a browser */
+  router.get('/health', async (req, res) => {
+    const out = { ok: true, mounted: true, adminEmailSet: !!adminEmail, allowedOrigins: Array.from(allowed), requestOrigin: req.headers.origin || null };
+    try { await db.ref('referralConfig').once('value'); out.db = 'ok'; } catch (e) { out.ok = false; out.db = errTxt(e); }
+    res.json(out);
   });
 
-  /* ───────── JOIN / ACTIVATE  (registration → 3-generation commission) ───────── */
+  router.get('/config', async (req, res) => {
+    try { const c = await getConfig(); res.set('Cache-Control', 'public, max-age=30').json({ ok: true, ...c, methods: METHODS }); }
+    catch (e) { log('config', errTxt(e)); res.status(500).json({ ok: false }); }
+  });
+
+  /* JOIN: referrer chain commissions (gen1/gen2/gen3) + signup bonus for the newcomer */
   router.post('/join', requireUser, async (req, res) => {
     const { cid, vph } = req.u;
     let phoneClaimed = false, phone = '';
@@ -140,12 +124,10 @@ module.exports = function mountReferral(app, opts) {
       locked = await withLock(cid, 60000);
       if (!locked) return res.status(429).json({ ok: false, code: 'BUSY', message: 'একটু অপেক্ষা করে আবার চেষ্টা করুন' });
 
-      // one phone → one member (blocks multi-account farming)
       const pc = await db.ref('referralPhones/' + phone).transaction((c) => (c ? undefined : cid));
       if (!pc.committed && pc.snapshot.val() !== cid) return res.status(409).json({ ok: false, code: 'PHONE_USED', message: 'এই মোবাইল নম্বর আগেই রেফারেলে যুক্ত আছে' });
       phoneClaimed = pc.committed;
 
-      // resolve referrer chain
       const raw = clip((req.body && req.body.code) || '', 20).trim().toUpperCase();
       let p1 = null, p2 = null, p3 = null;
       if (/^[A-Z0-9]{4,14}$/.test(raw)) {
@@ -160,7 +142,6 @@ module.exports = function mountReferral(app, opts) {
         }
       }
 
-      // own unique code
       let code = '';
       for (let i = 0; i < 8 && !code; i++) {
         const c = genCode();
@@ -169,7 +150,6 @@ module.exports = function mountReferral(app, opts) {
       }
       if (!code) throw new Error('code generation failed');
 
-      // masked identity for upline team lists
       let nm = '';
       try { nm = ((await db.ref('users/' + phone).once('value')).val() || {}).name || ''; } catch (e) {}
       const now = Date.now(), up = {};
@@ -188,16 +168,23 @@ module.exports = function mountReferral(app, opts) {
         }
         up['referralTeam/' + pid + '/g' + g + '/' + cid] = { name: maskName(nm), phone: maskPhone(phone), at: now };
       });
-      await db.ref().update(up);                         // ← single atomic write
-      res.json({ ok: true, joined: true, code, credited: [p1, p2, p3].filter(Boolean).length });
+      // signup bonus: only for newcomers who joined through a valid referral code
+      let bonus = 0;
+      if (p1 && cfg.signupBonus > 0) {
+        bonus = cfg.signupBonus;
+        up['referralWallets/' + cid + '/balance'] = inc(bonus);
+        up['referralWallets/' + cid + '/totalEarned'] = inc(bonus);
+        up['referralTx/' + cid + '/' + db.ref('referralTx/' + cid).push().key] = { type: 'bonus', amount: bonus, label: 'সাইন-আপ বোনাস', at: now };
+      }
+      await db.ref().update(up);
+      res.json({ ok: true, joined: true, code, credited: [p1, p2, p3].filter(Boolean).length, bonus });
     } catch (e) {
-      log('join error', String(e.message).slice(0, 200));
+      log('join error', errTxt(e));
       if (phoneClaimed && phone) db.ref('referralPhones/' + phone).remove().catch(() => {});
       res.status(500).json({ ok: false, message: 'কিছু সমস্যা হয়েছে, আবার চেষ্টা করুন' });
     } finally { if (locked) unlock(cid); }
   });
 
-  /* ───────── DASHBOARD ───────── */
   router.get('/dashboard', requireUser, async (req, res) => {
     try {
       const { cid, vph } = req.u;
@@ -222,10 +209,9 @@ module.exports = function mountReferral(app, opts) {
         team: { g1: arr(T.g1), g2: arr(T.g2), g3: arr(T.g3) },
         tx: list(tx.val()), payouts: list(pay.val()),
       });
-    } catch (e) { log('dashboard', String(e.message).slice(0, 200)); res.status(500).json({ ok: false, message: 'ডেটা লোড হয়নি' }); }
+    } catch (e) { log('dashboard', errTxt(e)); res.status(500).json({ ok: false, message: 'ডেটা লোড হয়নি' }); }
   });
 
-  /* ───────── WITHDRAW REQUEST ───────── */
   router.post('/withdraw', requireUser, async (req, res) => {
     const { cid } = req.u;
     let locked = false, deducted = 0;
@@ -261,13 +247,13 @@ module.exports = function mountReferral(app, opts) {
       catch (e) { await db.ref('referralWallets/' + cid + '/balance').set(inc(deducted)); deducted = 0; throw e; }
       res.json({ ok: true, id, balance: tr.snapshot.val() });
     } catch (e) {
-      log('withdraw error', String(e.message).slice(0, 200));
+      log('withdraw error', errTxt(e));
       if (deducted) db.ref('referralWallets/' + cid + '/balance').set(inc(deducted)).catch(() => {});
       res.status(500).json({ ok: false, message: 'অনুরোধ জমা হয়নি, আবার চেষ্টা করুন' });
     } finally { if (locked) unlock(cid); }
   });
 
-  /* ───────── ADMIN: payouts, config ───────── */
+  /* ADMIN */
   router.get('/admin/payouts', requireAdmin, async (req, res) => {
     try {
       const st = String(req.query.status || 'pending');
@@ -279,7 +265,7 @@ module.exports = function mountReferral(app, opts) {
         totals: { pendingCount: all.filter((x) => x.status === 'pending').length, pendingSum: sum('pending'), paidSum: sum('paid'), rejectedSum: sum('rejected') },
         list: (st === 'all' ? all : all.filter((x) => x.status === st)).slice(0, 200),
       });
-    } catch (e) { res.status(500).json({ ok: false, message: 'লোড ব্যর্থ' }); }
+    } catch (e) { log('admin/payouts', errTxt(e)); res.status(500).json({ ok: false, message: 'লোড ব্যর্থ — সার্ভার ত্রুটি: ' + errTxt(e) }); }
   });
   router.post('/admin/payout', requireAdmin, async (req, res) => {
     const id = String((req.body && req.body.id) || ''), action = String((req.body && req.body.action) || '');
@@ -301,30 +287,34 @@ module.exports = function mountReferral(app, opts) {
       if (trx) up['referralMyPayouts/' + p.cid + '/' + id + '/trxId'] = trx;
       if (action === 'paid') up['referralWallets/' + p.cid + '/totalWithdrawn'] = inc(Number(p.amount) || 0);
       else {
-        up['referralWallets/' + p.cid + '/balance'] = inc(Number(p.amount) || 0);          // refund
+        up['referralWallets/' + p.cid + '/balance'] = inc(Number(p.amount) || 0);
         up['referralTx/' + p.cid + '/' + db.ref('referralTx/' + p.cid).push().key] = { type: 'refund', amount: Number(p.amount) || 0, payoutId: id, at: now };
       }
       await db.ref().update(up);
       claimed = false;
       res.json({ ok: true });
     } catch (e) {
-      log('payout update', String(e.message).slice(0, 200));
+      log('admin/payout', errTxt(e));
       if (claimed) sref.set('pending').catch(() => {});
-      res.status(500).json({ ok: false, message: 'আপডেট ব্যর্থ' });
+      res.status(500).json({ ok: false, message: 'আপডেট ব্যর্থ: ' + errTxt(e) });
     }
   });
-  router.get('/admin/config', requireAdmin, async (req, res) => { try { res.json({ ok: true, ...(await getConfig(true)) }); } catch (e) { res.status(500).json({ ok: false }); } });
+  router.get('/admin/config', requireAdmin, async (req, res) => {
+    try { res.json({ ok: true, ...(await getConfig(true)) }); }
+    catch (e) { log('admin/config GET', errTxt(e)); res.status(500).json({ ok: false, message: 'কনফিগ লোড ব্যর্থ: ' + errTxt(e) }); }
+  });
   router.post('/admin/config', requireAdmin, async (req, res) => {
     try {
       const b = req.body || {};
       await db.ref('referralConfig').set({
         enabled: b.enabled !== false,
         gen1: num(b.gen1, 50, 0, 100000), gen2: num(b.gen2, 30, 0, 100000), gen3: num(b.gen3, 15, 0, 100000),
+        signupBonus: num(b.signupBonus, 20, 0, 100000),
         minWithdraw: Math.floor(num(b.minWithdraw, 500, 1, 10000000)),
       });
       cfgCache = null;
       res.json({ ok: true });
-    } catch (e) { res.status(500).json({ ok: false, message: 'সেভ ব্যর্থ' }); }
+    } catch (e) { log('admin/config POST', errTxt(e)); res.status(500).json({ ok: false, message: 'সেভ ব্যর্থ: ' + errTxt(e) }); }
   });
 
   app.use('/api/referral', router);
