@@ -4,14 +4,14 @@
  * v2: + signup bonus for newcomers who join with a valid referral code (admin-configurable, default 20)
  *     + error logging on every admin route, + GET /api/referral/health (diagnostics)
  *
- * server.js:   const mountReferral = require('./referral-3gen');  mountReferral(app, { admin });
+ * server.js:   import mountReferral from './referral-3gen.js';  mountReferral(app, { admin });
  * ENV: ADMIN_EMAIL (required) · SITE_URL · ALLOWED_ORIGINS (comma list, MUST include the admin site origin,
  *      e.g. https://movilover.github.io) · REF_REQUIRE_PHONE_VERIFY (default "true")
  */
-const crypto = require('crypto');
-const express = require('express');
+import crypto from 'crypto';
+import express from 'express';
 
-module.exports = function mountReferral(app, opts) {
+export default function mountReferral(app, opts) {
   opts = opts || {};
   const admin = opts.admin;
   if (!admin) throw new Error('referral-3gen: pass { admin }');
@@ -318,5 +318,10 @@ module.exports = function mountReferral(app, opts) {
   });
 
   app.use('/api/referral', router);
+  // ensure our routes sit BEFORE any catch-all 404 handler that buildApp() may have registered
+  try {
+    const stack = (app._router && app._router.stack) || (app.router && app.router.stack);
+    if (stack && stack.length) { const layer = stack.pop(); stack.unshift(layer); }
+  } catch (e) { log('could not reorder routes', errTxt(e)); }
   log('mounted /api/referral/* (phone verification ' + (REQUIRE_VERIFY ? 'REQUIRED' : 'OFF — not recommended') + ')');
-};
+}
