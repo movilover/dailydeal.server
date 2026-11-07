@@ -3,6 +3,7 @@ import { loadConfig } from './config.js';
 import { rtdbStore } from './store.js';
 import { buildApp } from './app.js';
 import { log } from './log.js';
+import mountReferral from './referral-3gen.js';
 
 let cfg;
 try { cfg = loadConfig(); } catch (e) { console.error(e.message); process.exit(1); }
@@ -21,6 +22,11 @@ catch (e) { console.error('Firebase চালু করা যায়নি: '
 
 process.on('unhandledRejection', (e) => log('error', 'unhandledRejection', { err: String(e && e.message).slice(0, 200) }));
 const { app, otp } = buildApp({ cfg, store: rtdbStore(admin.database()), adminAuth: admin.auth(), appCheck: admin.appCheck() });
+
+// ৩-জেনারেশন রেফারেল (/api/referral/*)
+try { mountReferral(app, { admin, adminEmail: cfg.adminEmail }); }
+catch (e) { console.error('রেফারেল মাউন্ট ব্যর্থ: ' + String(e.message).slice(0, 200)); }
+
 const srv = app.listen(cfg.port, () => log('info', 'listening', { port: cfg.port }));
 setInterval(() => otp.cleanup().catch((e) => log('error', 'cleanup', { err: e.message })), 10 * 60e3).unref();
 for (const s of ['SIGTERM', 'SIGINT']) process.on(s, () => srv.close(() => process.exit(0)));
