@@ -319,10 +319,5 @@ export default function mountReferral(app, opts) {
   });
 
   app.use('/api/referral', router);
-  // ensure our routes sit BEFORE any catch-all 404 handler that buildApp() may have registered
-  try {
-    const stack = (app._router && app._router.stack) || (app.router && app.router.stack);
-    if (stack && stack.length) { const layer = stack.pop(); stack.unshift(layer); }
-  } catch (e) { log('could not reorder routes', errTxt(e)); }
   log('mounted /api/referral/* (phone verification ' + (REQUIRE_VERIFY ? 'REQUIRED' : 'OFF — not recommended') + ')');
 }
