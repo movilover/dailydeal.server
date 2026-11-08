@@ -98,7 +98,7 @@ export default function mountReferral(app, opts) {
 
   /* health: open https://YOUR-RAILWAY-URL/api/referral/health in a browser */
   router.get('/health', async (req, res) => {
-    const out = { ok: true, mounted: true, adminEmailSet: !!adminEmail, allowedOrigins: Array.from(allowed), requestOrigin: req.headers.origin || null };
+    const out = { ok: true, mounted: true, build: 'v3-hook',  adminEmailSet: !!adminEmail, allowedOrigins: Array.from(allowed), requestOrigin: req.headers.origin || null };
     try { await db.ref('referralConfig').once('value'); out.db = 'ok'; } catch (e) { out.ok = false; out.db = errTxt(e); }
     res.json(out);
   });
@@ -319,5 +319,5 @@ export default function mountReferral(app, opts) {
   });
 
   app.use('/api/referral', router);
-  log('mounted /api/referral/* (phone verification ' + (REQUIRE_VERIFY ? 'REQUIRED' : 'OFF — not recommended') + ')');
+  log('v3-hook mounted /api/referral/* (phone verification ' + (REQUIRE_VERIFY ? 'REQUIRED' : 'OFF — not recommended') + ')');
 }
