@@ -12,6 +12,18 @@ import { lookupRoutes } from './route-lookup.js';
 import { makeHttp } from './net.js';
 import { log } from './log.js';
 
+// Express-এর res.status/res.json-এর উপর নির্ভর না করে সরাসরি JSON পাঠায় — এরর-হ্যান্ডলার নিজে আর কখনো ভাঙবে না
+function sendJson(res, code, obj) {
+  try {
+    if (res.headersSent || res.writableEnded) return;
+    const body = JSON.stringify(obj);
+    res.statusCode = code;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Length', Buffer.byteLength(body));
+    res.end(body);
+  } catch { /* ignore */ }
+}
+
 export function buildApp({ cfg, store, adminAuth, appCheck, http = makeHttp(), now = Date.now, extra }) {
   const app = express();
   app.set('trust proxy', 1);
@@ -20,14 +32,14 @@ export function buildApp({ cfg, store, adminAuth, appCheck, http = makeHttp(), n
   app.use(express.json({ limit: '32kb' }));
   const allowed = new Set(cfg.origins);
   // /healthz সবার জন্য খোলা এবং যেকোনো Origin-এ উত্তর দেয়; শুধু জানায় কলারের Origin অনুমোদিত কিনা। অ্যাডমিন প্যানেল এ থেকে CORS-ভুল ধরে।
-  app.get('/healthz', (req, res) => { res.set('Access-Control-Allow-Origin', '*'); const o = req.headers.origin; res.json({ ok: true, t: now(), originAllowed: o ? allowed.has(o) : null }); });
-  app.use((req, res, next) => { const o = req.headers.origin; if (o && !allowed.has(o)) return res.status(403).json({ ok: false, code: 'ORIGIN' }); next(); });
+  app.get('/healthz', (req, res) => { res.setHeader('Access-Control-Allow-Origin', '*'); const o = req.headers.origin; sendJson(res, 200, { ok: true, t: now(), originAllowed: o ? allowed.has(o) : null }); });
+  app.use((req, res, next) => { const o = req.headers.origin; if (o && !allowed.has(o)) return sendJson(res, 403, { ok: false, code: 'ORIGIN' }); next(); });
   app.use(cors({ origin: (o, cb) => cb(null, !o || allowed.has(o)), allowedHeaders: ['Authorization', 'Content-Type', 'X-Firebase-AppCheck'], methods: ['GET', 'POST', 'PUT', 'OPTIONS'], maxAge: 600 }));
   // coarse per-IP flood guard (in-memory; fine-grained limits live in the store)
   const flood = new Map();
-  app.use((req, res, next) => { const t = now(), k = req.ip; const e = flood.get(k); if (!e || t - e.s > 60e3) flood.set(k, { s: t, n: 1 }); else if (++e.n > 120) return res.status(429).json({ ok: false, code: 'RATE' }); if (flood.size > 5000) flood.clear(); next(); });
+  app.use((req, res, next) => { const t = now(), k = req.ip; const e = flood.get(k); if (!e || t - e.s > 60e3) flood.set(k, { s: t, n: 1 }); else if (++e.n > 120) return sendJson(res, 429, { ok: false, code: 'RATE' }); if (flood.size > 5000) flood.clear(); next(); });
 
-  // অতিরিক্ত রুট (যেমন ৩-জেনারেশন রেফারেল) — সবসময় 404 হ্যান্ডলারের আগে বসে
+  // অতিরিক্ত রুট (যেমন রেফারেল /api/referral/*) — সবসময় 404 হ্যান্ডলারের আগে বসে
   if (typeof extra === 'function') extra(app);
 
   const otpConfig = createOtpConfig({ store, encKey: cfg.encKey, now });
@@ -40,7 +52,11 @@ export function buildApp({ cfg, store, adminAuth, appCheck, http = makeHttp(), n
   app.use('/otp', otpRoutes({ auth, otp, flags, adminAuth, store }));
   app.use('/admin', adminRoutes({ auth, otpConfig, chain, store, flags, cfg, otp }));
   app.use('/', lookupRoutes({ auth, store, otp }));
-  app.use((_q, res) => res.status(404).json({ ok: false, code: 'NOT_FOUND' }));
-  app.use((err, _q, res, _n) => { log('error', 'unhandled', { err: err.message }); res.status(err.type === 'entity.parse.failed' ? 400 : 500).json({ ok: false, code: 'ERR' }); });
+  app.use((_q, res) => sendJson(res, 404, { ok: false, code: 'NOT_FOUND' }));
+  // এরর-হ্যান্ডলার: আসল এরর + স্ট্যাকের প্রথম লাইনগুলো লগে আসে, ক্লায়েন্টকে নিরাপদ উত্তর যায়
+  app.use((err, _q, res, _n) => {
+    log('error', 'unhandled', { err: String(err && err.message).slice(0, 200), at: String(err && err.stack).split('\n').slice(1, 3).join(' | ').slice(0, 300) });
+    sendJson(res, err && err.type === 'entity.parse.failed' ? 400 : 500, { ok: false, code: 'ERR' });
+  });
   return { app, otp, chain, otpConfig, flags };
 }
