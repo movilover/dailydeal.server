@@ -12,7 +12,7 @@ import { lookupRoutes } from './route-lookup.js';
 import { makeHttp } from './net.js';
 import { log } from './log.js';
 
-export function buildApp({ cfg, store, adminAuth, appCheck, http = makeHttp(), now = Date.now }) {
+export function buildApp({ cfg, store, adminAuth, appCheck, http = makeHttp(), now = Date.now, extra }) {
   const app = express();
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
@@ -26,6 +26,9 @@ export function buildApp({ cfg, store, adminAuth, appCheck, http = makeHttp(), n
   // coarse per-IP flood guard (in-memory; fine-grained limits live in the store)
   const flood = new Map();
   app.use((req, res, next) => { const t = now(), k = req.ip; const e = flood.get(k); if (!e || t - e.s > 60e3) flood.set(k, { s: t, n: 1 }); else if (++e.n > 120) return res.status(429).json({ ok: false, code: 'RATE' }); if (flood.size > 5000) flood.clear(); next(); });
+
+  // অতিরিক্ত রুট (যেমন ৩-জেনারেশন রেফারেল) — সবসময় 404 হ্যান্ডলারের আগে বসে
+  if (typeof extra === 'function') extra(app);
 
   const otpConfig = createOtpConfig({ store, encKey: cfg.encKey, now });
   const chain = createChain({ getConfig: otpConfig.load, store, now, http, log });
