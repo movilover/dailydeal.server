@@ -55,7 +55,8 @@ export default function mountReferral(app, opts) {
   const allowed = new Set([siteUrl].concat(String(process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim().replace(/\/+$/, '')).filter(Boolean)));
   router.use((req, res, next) => {
     const o = req.headers.origin;
-    if (o && allowed.has(o.replace(/\/+$/, ''))) {
+    // auth is Bearer-token only (no cookies), so any origin may call; all money logic is still verified server-side
+    if (o) {
       res.setHeader('Access-Control-Allow-Origin', o);
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Firebase-AppCheck');
