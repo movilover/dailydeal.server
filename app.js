@@ -26,13 +26,15 @@ function sendJson(res, code, obj) {
 
 export function buildApp({ cfg, store, adminAuth, appCheck, http = makeHttp(), now = Date.now, extra }) {
   const app = express();
-  app.set('trust proxy', 1);
+  // Render/Railway-র সামনে যতগুলো প্রক্সি, ততটা বিশ্বাস করা হয় (ডিফল্ট ১)। Render-এ আইপি ভুল এলে Environment-এ TRUST_PROXY_HOPS=2 দিন
+  const hops = Number(process.env.TRUST_PROXY_HOPS);
+  app.set('trust proxy', Number.isInteger(hops) && hops >= 0 && hops <= 5 ? hops : 1);
   app.disable('x-powered-by');
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));   // পড়ার অনুমতি CORS ঠিক করে; এটি না দিলে ব্রাউজার ডায়াগনস্টিক আটকায়
   app.use(express.json({ limit: '32kb' }));
   const allowed = new Set(cfg.origins);
   // /healthz সবার জন্য খোলা এবং যেকোনো Origin-এ উত্তর দেয়; শুধু জানায় কলারের Origin অনুমোদিত কিনা। অ্যাডমিন প্যানেল এ থেকে CORS-ভুল ধরে।
-  app.get('/healthz', (req, res) => { res.setHeader('Access-Control-Allow-Origin', '*'); const o = req.headers.origin; sendJson(res, 200, { ok: true, t: now(), originAllowed: o ? allowed.has(o) : null }); });
+  app.get('/healthz', (req, res) => { res.setHeader('Access-Control-Allow-Origin', '*'); const o = req.headers.origin; sendJson(res, 200, { ok: true, t: now(), originAllowed: o ? allowed.has(o) : null, ip: req.ip }); });
   app.use((req, res, next) => { const o = req.headers.origin; if (o && !allowed.has(o)) return sendJson(res, 403, { ok: false, code: 'ORIGIN' }); next(); });
   app.use(cors({ origin: (o, cb) => cb(null, !o || allowed.has(o)), allowedHeaders: ['Authorization', 'Content-Type', 'X-Firebase-AppCheck'], methods: ['GET', 'POST', 'PUT', 'OPTIONS'], maxAge: 600 }));
   // coarse per-IP flood guard (in-memory; fine-grained limits live in the store)
