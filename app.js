@@ -35,8 +35,10 @@ export function buildApp({ cfg, store, adminAuth, appCheck, http = makeHttp(), n
   const allowed = new Set(cfg.origins);
   // /healthz সবার জন্য খোলা এবং যেকোনো Origin-এ উত্তর দেয়; শুধু জানায় কলারের Origin অনুমোদিত কিনা। অ্যাডমিন প্যানেল এ থেকে CORS-ভুল ধরে।
   app.get('/healthz', (req, res) => { res.setHeader('Access-Control-Allow-Origin', '*'); const o = req.headers.origin; sendJson(res, 200, { ok: true, t: now(), originAllowed: o ? allowed.has(o) : null, ip: req.ip }); });
+  // Keep-alive: UptimeRobot/cron-job.org প্রতি ৫ মিনিটে এটা কল করবে (ডাটাবেস ছোঁয় না, ফ্লাড-গার্ডে গোনা হয় না)
+  app.get('/ping', (_q, res) => { res.setHeader('Cache-Control', 'no-store'); res.statusCode = 204; res.end(); });
   app.use((req, res, next) => { const o = req.headers.origin; if (o && !allowed.has(o)) return sendJson(res, 403, { ok: false, code: 'ORIGIN' }); next(); });
-  app.use(cors({ origin: (o, cb) => cb(null, !o || allowed.has(o)), allowedHeaders: ['Authorization', 'Content-Type', 'X-Firebase-AppCheck'], methods: ['GET', 'POST', 'PUT', 'OPTIONS'], maxAge: 600 }));
+  app.use(cors({ origin: (o, cb) => cb(null, !o || allowed.has(o)), allowedHeaders: ['Authorization', 'Content-Type', 'X-Firebase-AppCheck'], methods: ['GET', 'POST', 'PUT', 'PATCH', 'OPTIONS'], maxAge: 600 }));
   // coarse per-IP flood guard (in-memory; fine-grained limits live in the store)
   const flood = new Map();
   app.use((req, res, next) => { const t = now(), k = req.ip; const e = flood.get(k); if (!e || t - e.s > 60e3) flood.set(k, { s: t, n: 1 }); else if (++e.n > 120) return sendJson(res, 429, { ok: false, code: 'RATE' }); if (flood.size > 5000) flood.clear(); next(); });
