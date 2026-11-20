@@ -1,0 +1,23 @@
+# ঐচ্ছিক Render Blueprint। হাতে Web Service বানালে এটা লাগবে না (নিচের মানগুলোই হাতে বসান)।
+services:
+  - type: web
+    name: dailydeal-server
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - { key: NODE_VERSION, value: "20" }
+      - { key: NODE_ENV, value: production }
+      - { key: FIREBASE_SERVICE_ACCOUNT_B64, sync: false }
+      - { key: FIREBASE_DATABASE_URL, sync: false }
+      - { key: ADMIN_EMAIL, sync: false }
+      - { key: ALLOWED_ORIGINS, sync: false }
+      - { key: CONFIG_ENC_KEY, sync: false }
+      - { key: OTP_HMAC_SECRET, sync: false }
+      - { key: CJ_API_KEY, sync: false }
+      - { key: DAILY_SMS_CAP, value: "300" }
+      - { key: APPCHECK_ENFORCE, value: "false" }
+      - { key: KEEPALIVE_SELF, value: "1" }
