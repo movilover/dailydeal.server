@@ -4,6 +4,9 @@ import { rtdbStore } from './store.js';
 import { buildApp } from './app.js';
 import { log } from './log.js';
 import mountReferral from './referral-3gen.js';
+import { createAuth } from './auth.js';
+import { mountCj } from './route-cj.js';
+import { startSelfPing } from './keepalive.js';
 
 let cfg;
 try { cfg = loadConfig(); } catch (e) { console.error(e.message); process.exit(1); }
@@ -25,9 +28,15 @@ process.on('unhandledRejection', (e) => log('error', 'unhandledRejection', { err
 const extra = (app) => {
   try { mountReferral(app, { admin, adminEmail: cfg.adminEmail }); }
   catch (e) { console.error('রেফারেল মাউন্ট ব্যর্থ: ' + String(e.message).slice(0, 200)); }
+  // CJdropshipping (/api/admin/cj/*, /api/public/*) — ব্যর্থ হলেও OTP/রেফারেল চলতেই থাকবে
+  try {
+    mountCj(app, { auth: createAuth({ adminAuth: admin.auth(), appCheck: admin.appCheck(), cfg }), store: rtdbStore(admin.database()), newKey: (p) => admin.database().ref(p).push().key });
+  } catch (e) { console.error('CJ মাউন্ট ব্যর্থ: ' + String(e.message).slice(0, 200)); }
 };
 const { app, otp } = buildApp({ cfg, store: rtdbStore(admin.database()), adminAuth: admin.auth(), appCheck: admin.appCheck(), extra });
 
 const srv = app.listen(cfg.port, () => log('info', 'listening', { port: cfg.port }));
+srv.keepAliveTimeout = 65e3; srv.headersTimeout = 66e3;   // Render-এর প্রক্সির চেয়ে বেশি → হঠাৎ 502 কমে
+startSelfPing(process.env);                               // Render ফ্রি প্ল্যানে ঘুমিয়ে পড়া ঠেকায় (KEEPALIVE_SELF=0 দিলে বন্ধ)
 setInterval(() => otp.cleanup().catch((e) => log('error', 'cleanup', { err: e.message })), 10 * 60e3).unref();
 for (const s of ['SIGTERM', 'SIGINT']) process.on(s, () => srv.close(() => process.exit(0)));
