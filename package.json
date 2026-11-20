@@ -2,14 +2,15 @@
   "name": "dailydeal-server",
   "version": "1.0.0",
   "private": true,
-  "description": "DailyDeal OTP/SMS backend (Railway)",
+  "description": "DailyDeal OTP/SMS + CJdropshipping backend (Render)",
   "type": "module",
   "main": "server.js",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test:cj": "node --test cj.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
