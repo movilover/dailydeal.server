@@ -147,13 +147,47 @@ export function createCj({ store, newKey, env = process.env, fetchImpl = globalT
       return tokenMem.access;
     });
   }
-  async function cj(method, path, opts = {}, attempt = 0) {
+  /* ── রেট-লিমিট সেফগার্ড ──
+     • isRL: কোড বা মেসেজ দেখে চিনে (একই-IP লিমিট "one ip limit 3 users" সহ)
+     • ক্যাশ: একই GET (লিস্ট/ক্যাটাগরি/ডিটেইল/স্টক) অল্প সময়ে আবার CJ-তে যায় না; একই সময়ের একই রিকোয়েস্ট একটাই যায়
+     • stale-on-error: CJ লিমিট দিলে পুরোনো (৬ ঘণ্টা পর্যন্ত) ক্যাশ ডাটা দেখায়, ব্যর্থ করে না
+     • কুলডাউন: লিমিট ধরলে অল্প সময় CJ-তে নতুন কল বন্ধ, যাতে লিমিট আরও না বাড়ে */
+  const cache = new Map(), inflight = new Map(); let rlUntil = 0;
+  const COOL_MS = Number(env.CJ_COOLDOWN_MS) || 20000;
+  const isRL = (status, code, msg) => status === 429 || code === 1600200 || code === 1600201 || /too many|rate.?limit|one ip limit|qps|frequen/i.test(String(msg || ''));
+  const ttlFor = (m, path) => (m !== 'GET' ? 0 : /getCategory/.test(path) ? 600e3 : /product\/list/.test(path) ? 90e3 : /getInventoryByPid/.test(path) ? 60e3 : /product\/query/.test(path) ? 180e3 : 0);
+  const rlError = () => { const e = new HttpError(429, 'CJ: Too Many Requests (CJ rate/IP limit) — ' + Math.max(1, Math.ceil((rlUntil - Date.now()) / 1000)) + 's পরে আবার চেষ্টা করুন'); e.rateLimited = true; return e; };
+
+  async function cjCall(method, path, opts = {}, attempt = 0) {
+    if (Date.now() < rlUntil) { if (opts.patient) await sleep(rlUntil - Date.now() + 500); else throw rlError(); }
     const token = await getToken();
-    const r = await throttled(() => raw(method, path, { ...opts, token })); const code = r.j && r.j.code;
-    if ((r.status === 401 || code === 1600001) && attempt === 0) { if (tokenMem) tokenMem.access = ''; await getToken(true); return cj(method, path, opts, 1); }
-    if ((r.status === 429 || code === 1600200 || code === 1600201) && attempt < 3) { await sleep(1500 * (attempt + 1)); return cj(method, path, opts, attempt + 1); }
-    if (!r.j || r.j.result === false || (code && code !== 200)) { const msg = (r.j && r.j.message) || ('HTTP ' + r.status); stats.lastError = path + ': ' + msg; throw new HttpError(502, 'CJ: ' + msg); }
+    const r = await throttled(() => raw(method, path, { ...opts, token })); const code = r.j && r.j.code, msg = r.j && r.j.message;
+    if ((r.status === 401 || code === 1600001) && attempt === 0) { if (tokenMem) tokenMem.access = ''; await getToken(true); return cjCall(method, path, opts, 1); }
+    if (isRL(r.status, code, msg)) {
+      if (attempt < 3) { await sleep(2000 * (attempt + 1)); return cjCall(method, path, opts, attempt + 1); }      // ২s, ৪s, ৬s
+      rlUntil = Date.now() + COOL_MS; stats.lastError = path + ': ' + (msg || 'rate limited');
+      if (opts.patient && (opts.pRetries || 0) < 2) return cjCall(method, path, { ...opts, pRetries: (opts.pRetries || 0) + 1 }, 0);   // সিঙ্কের মতো ব্যাকগ্রাউন্ড কাজ: অপেক্ষা করে আবার
+      const e = rlError(); e.message += ' | CJ: ' + String(msg || '').slice(0, 160); throw e;
+    }
+    if (!r.j || r.j.result === false || (code && code !== 200)) { const m2 = msg || ('HTTP ' + r.status); stats.lastError = path + ': ' + m2; throw new HttpError(502, 'CJ: ' + m2); }
     stats.lastOkAt = Date.now(); return r.j.data;
+  }
+  async function cj(method, path, opts = {}) {
+    const m = String(method).toUpperCase(), ttl = ttlFor(m, path), cacheable = ttl > 0;
+    const key = m + ' ' + path + ' ' + JSON.stringify(Object.entries(opts.query || {}).sort());
+    if (cacheable && !opts.fresh) { const c = cache.get(key); if (c && Date.now() - c.at < ttl) return c.v; if (inflight.has(key)) return inflight.get(key); }
+    const run = (async () => {
+      try {
+        const v = await cjCall(m, path, opts);
+        if (cacheable) { cache.delete(key); cache.set(key, { at: Date.now(), v }); if (cache.size > 300) cache.delete(cache.keys().next().value); }
+        return v;
+      } catch (e) {
+        if (cacheable && e.rateLimited) { const c = cache.get(key); if (c && Date.now() - c.at < 6 * 36e5) { stats.lastError = '(পুরোনো ক্যাশ দেখানো হয়েছে) ' + e.message; return c.v; } }
+        throw e;
+      }
+    })();
+    if (cacheable && !opts.fresh) { inflight.set(key, run); run.then(() => inflight.delete(key), () => inflight.delete(key)); }
+    return run;
   }
   async function status() {
     const t = tokenMem || (await store.get(E('token')));
@@ -180,9 +214,9 @@ export function createCj({ store, newKey, env = process.env, fetchImpl = globalT
     if (all.length > 1500) for (const o of all.slice(1000)) await store.remove(E('log/' + o.key)).catch(() => {});      // পুরোনো লগ ছাঁটা
     return all.slice(0, clamp(limit, 1, 500));
   }
-  async function fetchStock(pid) {      // CJ: getInventoryByPid। ভার্সনভেদে আকার ভিন্ন → সহনশীল পার্সিং; না পেলে null (আন্দাজ বসানো হয়, "estimated" চিহ্নিত)
+  async function fetchStock(pid, o = {}) {      // CJ: getInventoryByPid। ভার্সনভেদে আকার ভিন্ন → সহনশীল পার্সিং; না পেলে null (আন্দাজ বসানো হয়, "estimated" চিহ্নিত)
     try {
-      const d = await cj('GET', '/product/stock/getInventoryByPid', { query: { pid } });
+      const d = await cj('GET', '/product/stock/getInventoryByPid', { query: { pid }, ...o });
       const rows = d && (d.variantInventories || d.inventories || (Array.isArray(d) ? d : null)); if (!rows) return null;
       const byVid = {}; let total = 0;
       for (const r of rows) { const inv = Array.isArray(r.inventory) ? r.inventory.reduce((s, i) => s + N(i.totalInventory != null ? i.totalInventory : i.storageNum), 0) : N(r.totalInventory != null ? r.totalInventory : r.storageNum); if (r.vid) byVid[r.vid] = (byVid[r.vid] || 0) + inv; total += inv; }
@@ -225,9 +259,9 @@ export function createCj({ store, newKey, env = process.env, fetchImpl = globalT
       const pending = {}, alerts = {}; let stockUpdated = 0, priceApplied = 0, checked = 0;
       for (const [key, p] of mine) {
         try {
-          const d = await cj('GET', '/product/query', { query: { pid: p.source.supplierProductId } }); checked++;
+          const d = await cj('GET', '/product/query', { query: { pid: p.source.supplierProductId }, fresh: true, patient: true }); checked++;
           if (!d) { alerts[key] = { name: p.name, type: 'unavailable', at: Date.now() }; continue; }
-          const detail = normDetail(d), st = await fetchStock(detail.pid), newCost = minCost(detail);
+          const detail = normDetail(d), st = await fetchStock(detail.pid, { fresh: true, patient: true }), newCost = minCost(detail);
           if (st && st.total <= 0) alerts[key] = { name: p.name, type: 'out_of_stock', at: Date.now() };
           if (st && s.sync.autoStock && N(p.stock) !== st.total) { await store.update('products/' + key, { stock: Math.floor(st.total), stockKnown: true, updatedAt: new Date().toISOString() }); stockUpdated++; }
           const oldCost = N(p.pricing && p.pricing.costUsd);
