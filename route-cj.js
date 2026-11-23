@@ -113,6 +113,10 @@ export function mountCj(app, { auth, store, newKey, env = process.env, fetchImpl
 
   /* ----- ইমপোর্ট / হিস্ট্রি ----- */
   A.post('/import', wrap(async (req, res) => res.json({ ok: true, ...(await core.runImport(req.body && req.body.items, req.user.email)) })));
+  /* অটো-ইমপোর্ট কিউ (CJ লিমিটের সময় পণ্য এখানে জমে, সার্ভার নিজে ইমপোর্ট করে) */
+  A.get('/import/queue', wrap(async (_q, res) => res.json({ ok: true, list: await core.queueList() })));
+  A.post('/import/queue/run', wrap(async (_q, res) => res.json({ ok: true, ...(await core.processQueue()) })));
+  A.delete('/import/queue/:pid', wrap(async (req, res) => { await core.queueRemove(req.params.pid); res.json({ ok: true }); }));
   A.get('/history', wrap(async (req, res) => res.json({ ok: true, list: await core.history(parseInt(req.query.limit) || 200) })));
 
   /* ----- সিঙ্ক ----- */
@@ -161,5 +165,6 @@ export function mountCj(app, { auth, store, newKey, env = process.env, fetchImpl
   app.use('/api/admin/cj', A);
   app.use('/api/public', P);
   setImmediate(() => core.warm());
+  const qt = setInterval(() => core.processQueue().catch(() => {}), 60e3); if (qt.unref) qt.unref();      // প্রতি ১ মিনিটে কিউ চেক
   return core;
 }
