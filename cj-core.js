@@ -1,6 +1,7 @@
 // CJdropshipping মূল লজিক: টোকেন ক্যাশ + থ্রটল, এক্সচেঞ্জ রেট, প্রাইসিং ইঞ্জিন, ইমপোর্ট, সিঙ্ক।
 // সব ডেটা serverState/cj/* এ থাকে (সার্ভার-অনলি; ব্রাউজার কখনো পড়ে না — আপনার OTP ডেটার মতোই)।
 import { N, clamp, str, safeKey, cleanText, HttpError } from './cj-safe.js';
+import { createHash } from 'node:crypto';
 
 export const ROOT = 'serverState/cj';
 export const DEFAULT_SETTINGS = {
@@ -140,7 +141,7 @@ export function createCj({ store, newKey, env = process.env, fetchImpl = globalT
       let r = null;
       if (tokenMem && tokenMem.refresh && tokenMem.refreshExp > Date.now()) { r = await raw('POST', '/authentication/refreshAccessToken', { body: { refreshToken: tokenMem.refresh } }); if (!(r.j && r.j.result)) r = null; }
       if (!r) r = await raw('POST', '/authentication/getAccessToken', { body: { apiKey } });
-      if (!(r.j && r.j.result && r.j.data && r.j.data.accessToken)) { const msg = (r.j && r.j.message) || ('HTTP ' + r.status); stats.lastError = 'auth: ' + msg; throw new HttpError(502, 'CJ authentication failed: ' + msg); }
+      if (!(r.j && r.j.result && r.j.data && r.j.data.accessToken)) { const msg = (r.j && r.j.message) || ('HTTP ' + r.status); stats.lastError = 'auth: ' + msg; const he = new HttpError(502, 'CJ authentication failed: ' + msg); he.rateLimited = isRL(r.status, r.j && r.j.code, msg); throw he; }
       const d = r.j.data;
       tokenMem = { access: d.accessToken, accessExp: isoMs(d.accessTokenExpiryDate) || Date.now() + 14 * 864e5, refresh: d.refreshToken || '', refreshExp: isoMs(d.refreshTokenExpiryDate) || Date.now() + 179 * 864e5, fetchedAt: Date.now() };
       await store.set(E('token'), tokenMem).catch(() => {});
@@ -155,7 +156,9 @@ export function createCj({ store, newKey, env = process.env, fetchImpl = globalT
   const cache = new Map(), inflight = new Map(); let rlUntil = 0;
   const COOL_MS = Number(env.CJ_COOLDOWN_MS) || 20000;
   const isRL = (status, code, msg) => status === 429 || code === 1600200 || code === 1600201 || /too many|rate.?limit|one ip limit|qps|frequen/i.test(String(msg || ''));
-  const ttlFor = (m, path) => (m !== 'GET' ? 0 : /getCategory/.test(path) ? 600e3 : /product\/list/.test(path) ? 90e3 : /getInventoryByPid/.test(path) ? 60e3 : /product\/query/.test(path) ? 180e3 : 0);
+  const ttlFor = (m, path) => (m !== 'GET' ? 0 : /getCategory/.test(path) ? 3600e3 : /product\/list/.test(path) ? 600e3 : /getInventoryByPid/.test(path) ? 300e3 : /product\/query/.test(path) ? 1800e3 : 0);   // লিস্ট ১০ মিনিট, ডিটেইল ৩০ মিনিট, স্টক ৫ মিনিট
+  const persistable = (path) => /product\/list|product\/query/.test(path);                   // এগুলো Firebase-এও সেভ হয় → সার্ভার ঘুমালেও/রিস্টার্টেও থাকে
+  const STALE_MS = 7 * 864e5, hashOf = (k) => createHash('sha1').update(k).digest('hex');
   const rlError = () => { const e = new HttpError(429, 'CJ: Too Many Requests (CJ rate/IP limit) — ' + Math.max(1, Math.ceil((rlUntil - Date.now()) / 1000)) + 's পরে আবার চেষ্টা করুন'); e.rateLimited = true; return e; };
 
   async function cjCall(method, path, opts = {}, attempt = 0) {
@@ -172,26 +175,33 @@ export function createCj({ store, newKey, env = process.env, fetchImpl = globalT
     if (!r.j || r.j.result === false || (code && code !== 200)) { const m2 = msg || ('HTTP ' + r.status); stats.lastError = path + ': ' + m2; throw new HttpError(502, 'CJ: ' + m2); }
     stats.lastOkAt = Date.now(); return r.j.data;
   }
+  async function readPersisted(h) { try { const c = await store.get(E('cache/' + h)); return c && c.at ? c : null; } catch { return null; } }
+  function writePersisted(h, at, v) { try { if (JSON.stringify(v).length > 180000) return; store.set(E('cache/' + h), { at, v }).catch(() => {}); store.update(E('cacheIdx'), { [h]: at }).catch(() => {}); } catch { /* ক্যাশ কখনো কাজ আটকায় না */ } }
   async function cj(method, path, opts = {}) {
-    const m = String(method).toUpperCase(), ttl = ttlFor(m, path), cacheable = ttl > 0;
-    const key = m + ' ' + path + ' ' + JSON.stringify(Object.entries(opts.query || {}).sort());
+    const m = String(method).toUpperCase(), ttl = ttlFor(m, path), cacheable = ttl > 0, persist = cacheable && persistable(path);
+    const key = m + ' ' + path + ' ' + JSON.stringify(Object.entries(opts.query || {}).sort()), h = persist ? hashOf(key) : '';
     if (cacheable && !opts.fresh) { const c = cache.get(key); if (c && Date.now() - c.at < ttl) return c.v; if (inflight.has(key)) return inflight.get(key); }
     const run = (async () => {
+      if (persist && !opts.fresh) { const pc = await readPersisted(h); if (pc && Date.now() - pc.at < ttl) { cache.set(key, { at: pc.at, v: pc.v }); return pc.v; } }
       try {
         const v = await cjCall(m, path, opts);
-        if (cacheable) { cache.delete(key); cache.set(key, { at: Date.now(), v }); if (cache.size > 300) cache.delete(cache.keys().next().value); }
+        if (cacheable) { const at = Date.now(); cache.delete(key); cache.set(key, { at, v }); if (cache.size > 300) cache.delete(cache.keys().next().value); if (persist) writePersisted(h, at, v); }
         return v;
       } catch (e) {
-        if (cacheable && e.rateLimited) { const c = cache.get(key); if (c && Date.now() - c.at < 6 * 36e5) { stats.lastError = '(পুরোনো ক্যাশ দেখানো হয়েছে) ' + e.message; return c.v; } }
+        if (cacheable && e.rateLimited) {
+          let c = cache.get(key); if (!c && persist) c = await readPersisted(h);
+          if (c && Date.now() - c.at < STALE_MS) { stats.lastError = '(পুরোনো ক্যাশ দেখানো হয়েছে) ' + e.message; return c.v; }
+        }
         throw e;
       }
     })();
-    if (cacheable && !opts.fresh) { inflight.set(key, run); run.then(() => inflight.delete(key), () => inflight.delete(key)); }
+    if (cacheable && !opts.fresh) { inflight.set(key, run); run.then(() => inflight.delete(key), () => inflight.delete(key)); }   // await-এর আগেই রেজিস্টার → ডুপ্লিকেট রোধ
     return run;
   }
   async function status() {
     const t = tokenMem || (await store.get(E('token')));
-    return { keyConfigured: !!apiKey, tokenCached: !!(t && t.access && t.accessExp > Date.now()), tokenExpiresAt: t ? t.accessExp : 0, calls: stats.calls, lastOkAt: stats.lastOkAt, lastError: stats.lastError };
+    let queued = 0; try { queued = Object.keys((await store.get(QK)) || {}).length; } catch { /* */ }
+    return { queued, cooldownSec: Math.max(0, Math.ceil((rlUntil - Date.now()) / 1000)), keyConfigured: !!apiKey, tokenCached: !!(t && t.access && t.accessExp > Date.now()), tokenExpiresAt: t ? t.accessExp : 0, calls: stats.calls, lastOkAt: stats.lastOkAt, lastError: stats.lastError };
   }
   async function getFx(settings) {
     const f = (settings && settings.fx) || {}, manual = N(f.manualRate) > 0 ? N(f.manualRate) : 0;
@@ -224,12 +234,12 @@ export function createCj({ store, newKey, env = process.env, fetchImpl = globalT
     } catch { return null; }
   }
 
-  async function runImport(items, by) {
+  async function runImport(items, by, o2 = {}) {
     if (!Array.isArray(items) || !items.length || items.length > 50) throw new HttpError(400, 'items: 1–50 products per request');
     const s = await loadSettings(), rules = await loadRules(), fx = await getFx(s), all = (await store.get('products')) || {};
     const seenPid = new Set(), seenSku = new Set(); let maxId = 0;
     for (const p of Object.values(all)) { if (!p) continue; maxId = Math.max(maxId, N(p.productId)); if (p.source && p.source.supplierId === 'cj') { seenPid.add(p.source.supplierProductId); (p.source.skus || []).forEach((k) => seenSku.add(k)); if (p.source.sku) seenSku.add(p.source.sku); } }
-    const out = { done: [], skipped: [], failed: [] };
+    const out = { done: [], skipped: [], failed: [], queued: [] };
     for (const raw0 of items) {
       const pid = str(raw0 && raw0.pid, 80); if (!pid) { out.failed.push({ pid: '', error: 'pid missing' }); continue; }
       try {
@@ -245,9 +255,35 @@ export function createCj({ store, newKey, env = process.env, fetchImpl = globalT
         seenPid.add(pid); (prod.source.skus || []).forEach((k) => seenSku.add(k));
         out.done.push({ pid, key, name: prod.name, price: prod.price, published: prod.active });
         await log({ type: 'import', pid, key, name: prod.name, price: prod.price, published: prod.active, by });
-      } catch (e) { out.failed.push({ pid, error: e.message }); await log({ type: 'import-failed', pid, error: e.message, by }); }
+      } catch (e) {
+        if (e.rateLimited && !o2.noQueue) { await enqueue(raw0, by); out.queued.push({ pid, reason: 'CJ limit — queued, will import automatically' }); await log({ type: 'import-queued', pid, by }); }
+        else { out.failed.push({ pid, error: e.message }); await log({ type: 'import-failed', pid, error: e.message, by }); }
+      }
     }
     return out;
+  }
+
+  /* ── অটো-ইমপোর্ট কিউ: CJ লিমিট ধরলে পণ্য কিউতে থাকে; সার্ভার প্রতি মিনিটে একটা একটা করে নিজে ইমপোর্ট করে, লিমিট কাটলেই চলে আসে ── */
+  const QK = E('importQueue'), QMAX_AGE = 24 * 36e5; let qBusy = false;
+  async function enqueue(raw0, by) {
+    const pid = str(raw0 && raw0.pid, 80); if (!pid) return;
+    await store.set(QK + '/' + safeKey(pid), clean({ pid, publish: raw0.publish === true, intlCat: raw0.intlCat ? str(raw0.intlCat, 100) : undefined, intlSub: raw0.intlSub ? str(raw0.intlSub, 100) : undefined, ruleOverride: validRule(raw0.ruleOverride) ? raw0.ruleOverride : undefined, delivery: raw0.delivery && typeof raw0.delivery === 'object' ? { mode: str(raw0.delivery.mode, 20), fee: N(raw0.delivery.fee) } : undefined, by: by || '', at: Date.now() }));
+  }
+  const queueList = async () => Object.values((await store.get(QK)) || {}).filter(Boolean).sort((a, b) => N(a.at) - N(b.at));
+  const queueRemove = (pid) => store.remove(QK + '/' + safeKey(pid));
+  async function processQueue() {
+    if (qBusy) return { busy: true }; if (Date.now() < rlUntil) return { waiting: true }; qBusy = true;
+    try {
+      const all = await queueList(), now = Date.now(); let done = 0;
+      for (const it of all) if (now - N(it.at) > QMAX_AGE) { await queueRemove(it.pid); await log({ type: 'import-failed', pid: it.pid, error: 'Queue expired (CJ stayed rate-limited for 24h)', by: 'queue' }); }
+      const batch = all.filter((it) => now - N(it.at) <= QMAX_AGE).slice(0, 3);
+      if (batch.length) {
+        const r = await runImport(batch.map(({ pid, publish, intlCat, intlSub, ruleOverride, delivery }) => ({ pid, publish, intlCat, intlSub, ruleOverride, delivery })), 'auto-queue', { noQueue: true });
+        for (const d of [...r.done, ...r.skipped]) { await queueRemove(d.pid); done++; }
+        for (const f of r.failed) if (!isRL(0, 0, f.error)) await queueRemove(f.pid);          // অন্য ধরনের ব্যর্থতা: কিউ থেকে বাদ (হিস্ট্রিতে লেখা আছে); লিমিট হলে থাকবে
+      }
+      return { processed: done, remaining: (await queueList()).length };
+    } finally { qBusy = false; }
   }
 
   // সিঙ্ক: নিজে হাতে বদলানো দাম কখনো নীরবে বদলায় না — অ্যাডমিনের অনুমোদনের অপেক্ষায় থাকে
@@ -280,7 +316,8 @@ export function createCj({ store, newKey, env = process.env, fetchImpl = globalT
       return last;
     } finally { syncing = false; }
   }
-  const warm = () => { loadSettings().catch(() => {}); if (apiKey) getToken().catch(() => {}); };     // ঘুম থেকে উঠে প্রথম রিকোয়েস্ট দ্রুত করতে
+  async function pruneCache() { try { const idx = (await store.get(E('cacheIdx'))) || {}, old = Object.entries(idx).filter(([, at]) => Date.now() - N(at) > STALE_MS).slice(0, 200); for (const [h] of old) { await store.remove(E('cache/' + h)).catch(() => {}); await store.remove(E('cacheIdx/' + h)).catch(() => {}); } } catch { /* */ } }
+  const warm = () => { loadSettings().catch(() => {}); if (apiKey) getToken().catch(() => {}); pruneCache(); };     // ঘুম থেকে উঠে প্রথম রিকোয়েস্ট দ্রুত করতে
 
-  return { E, cj, getToken, status, getFx, loadSettings, loadRules, log, history, fetchStock, runImport, runSync, warm };
+  return { E, cj, enqueue, queueList, queueRemove, processQueue, getToken, status, getFx, loadSettings, loadRules, log, history, fetchStock, runImport, runSync, warm };
 }
