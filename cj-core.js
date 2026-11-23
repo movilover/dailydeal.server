@@ -123,7 +123,7 @@ export function createCj({ store, newKey, env = process.env, fetchImpl = globalT
   async function raw(method, path, { query, body, token } = {}) {
     const url = new URL(base + path);
     for (const [k, v] of Object.entries(query || {})) if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, v);
-    const headers = { 'Content-Type': 'application/json' }; if (token) headers['CJ-Access-Token'] = token;
+    const headers = { 'Content-Type': 'application/json' }; if (token) headers['CJ-Access-Token'] = token; if (env.CJ_RELAY_KEY) headers['X-Relay-Key'] = env.CJ_RELAY_KEY;   // রিলে (Cloudflare Worker) ব্যবহার করলে গোপন কী
     const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 25000); let res, j;
     try { res = await fetchImpl(url, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: ctl.signal }); j = await res.json().catch(() => null); } finally { clearTimeout(t); }
     stats.calls++; return { status: res.status, j };
